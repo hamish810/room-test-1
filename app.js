@@ -1,5 +1,8 @@
 let currentRoom = null;
 let stopPublicWatch = null;
+let stopRoomWatch = null;
+let lastRows = [];
+let lastRoomData = { seats: [] };
 let busy = false;
 
 const appEl = document.getElementById("app");
@@ -25,14 +28,25 @@ function stopWatches() {
     stopPublicWatch();
     stopPublicWatch = null;
   }
+  if (stopRoomWatch) {
+    stopRoomWatch();
+    stopRoomWatch = null;
+  }
 }
 
 async function runAction(input) {
   const result = await mystack.run(input);
-  if (result && result.ok === false) {
-    throw new Error(result.error || "Request failed.");
+  if (result == null || (typeof result === "object" && !Object.keys(result).length)) {
+    throw new Error("Create/join did not reach the server. Redeploy the MyStack app host.");
   }
-  return result;
+  const body = result.ok != null || result.room ? result : result.data;
+  if (body && body.ok === false) {
+    throw new Error(body.error || "Request failed.");
+  }
+  if ((input.action === "create" || input.action === "join") && !(body && body.room)) {
+    throw new Error("No room code came back from the server.");
+  }
+  return body || result;
 }
 
 function escapeHtml(value) {
@@ -101,13 +115,16 @@ function renderLobby() {
   };
 }
 
-function renderRoom(rows) {
-  const items = (rows || [])
-    .slice()
-    .sort((a, b) => (a.data?.seat ?? 0) - (b.data?.seat ?? 0))
-    .map((row) => {
-      const presses = (row.data && row.data.presses) || 0;
-      return `<li>${escapeHtml(playerLabel(row))}: ${presses}</li>`;
+function renderRoom() {
+  const seats = Array.isArray(lastRoomData.seats) ? lastRoomData.seats : [];
+  const items = seats
+    .map((seat, index) => {
+      const row = lastRows.find((item) => item.data && item.data.seat === index);
+      const presses = Number(seat && seat.presses) || 0;
+      const label = row
+        ? playerLabel(row)
+        : `Player ${index + 1}`;
+      return `<li>${escapeHtml(label)}: ${presses}</li>`;
     })
     .join("");
 
@@ -149,14 +166,44 @@ function renderRoom(rows) {
   };
 }
 
+function paintRoom() {
+  if (!currentRoom) return;
+  renderRoom();
+}
+
 function enterRoom(room) {
   stopWatches();
   currentRoom = room;
-  renderRoom([]);
+  lastRows = [];
+  lastRoomData = { seats: [] };
+  paintRoom();
+
+  if (mystack.room.watch) {
+    stopRoomWatch = mystack.room.watch(room, ({ data }) => {
+      lastRoomData = data || { seats: [] };
+      paintRoom();
+    });
+  } else {
+    const pollRoom = async () => {
+      try {
+        const snapshot = await mystack.room.get(room);
+        lastRoomData = (snapshot && snapshot.data) || { seats: [] };
+        paintRoom();
+      } catch (err) {
+        showError(err);
+      }
+    };
+    pollRoom();
+    const roomId = setInterval(pollRoom, 3000);
+    stopRoomWatch = () => clearInterval(roomId);
+  }
 
   if (mystack.public.watch) {
     stopPublicWatch = mystack.public.watch(
-      ({ rows }) => renderRoom(rows),
+      ({ rows }) => {
+        lastRows = rows || [];
+        paintRoom();
+      },
       { order: "updated_at", limit: 50, match: { room } }
     );
     return;
@@ -169,7 +216,8 @@ function enterRoom(room) {
         limit: 50,
         match: { room },
       });
-      renderRoom(rows);
+      lastRows = rows || [];
+      paintRoom();
     } catch (err) {
       showError(err);
     }
